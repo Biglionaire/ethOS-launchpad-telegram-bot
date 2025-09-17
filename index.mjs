@@ -8,14 +8,15 @@ const {
   BOT_TOKEN,
   TARGET_CHAT_ID,
   RPC_WSS,
-  CHAIN_ID = '11155111',                 // 11155111 = Sepolia, 1 = Mainnet
+  CHAIN_ID = '1',                        // <-- default MAINNET (1). Use '11155111' for Sepolia.
   LAUNCHPAD_ADDRESS,
   ETHERSCAN_API_KEY,
   ETHOS_URL_TEMPLATE = 'https://ethos.vision/?t={CA}',
   CREATE_EVENT_NAMES = 'TokenCreated,Created,Launched,TokenLaunched',
   LOCK_EVENT_NAMES   = 'SettingsLocked,LiquidityLocked,MechanismLocked',
-  FROM_BLOCK,                              // contoh: latest-50
-  WETH_ADDRESS                             // opsional (bot auto-detect via Deposit event)
+  FROM_BLOCK,                             // e.g. latest-50
+  WETH_ADDRESS,                           // optional; falls back to canonical WETH on mainnet
+  LAUNCHPAD_ABI                           // optional JSON string to override Etherscan ABI fetch
 } = process.env;
 
 if (!BOT_TOKEN || !TARGET_CHAT_ID || !RPC_WSS || !LAUNCHPAD_ADDRESS) {
@@ -32,7 +33,8 @@ const send = async (html, rows = null) => {
 };
 
 /* =================== Provider =================== */
-const provider = new ethers.WebSocketProvider(RPC_WSS, Number(CHAIN_ID));
+const chainIdNum = Number(CHAIN_ID);
+const provider = new ethers.WebSocketProvider(RPC_WSS, chainIdNum);
 
 /* ============== Etherscan ABI (optional) ============== */
 const chainToApiBase = id =>
@@ -41,6 +43,10 @@ const chainToApiBase = id =>
   : 'https://api.etherscan.io/api';
 
 async function fetchAbi(address) {
+  // Prefer inline env ABI if provided
+  if (LAUNCHPAD_ABI) {
+    try { return JSON.parse(LAUNCHPAD_ABI); } catch (e) { console.warn('Failed to parse LAUNCHPAD_ABI env:', e.message); }
+  }
   if (!ETHERSCAN_API_KEY) return null;
   try {
     const url = `${chainToApiBase(CHAIN_ID)}?module=contract&action=getabi&address=${address}&apikey=${ETHERSCAN_API_KEY}`;
@@ -135,9 +141,8 @@ const MECH_UINT_KEYS = envList('MECH_UINT_KEYS', [
   'liquidity_fee','auto_lp','auto_lp_share','lp_share','liquidity_share',
   'dev_fee','dev_share','developer_fee',
   'gamble','gamble_fee','gamble_share','gamble_percent',
-  'buy_fee','sell_fee','tax_fee','total_fee',
   'burn_buy','burn_sell','max_daily_pump','death_time','reaper_period',
-  'apy','apy_per_epoch','max_wallet','max_tx'
+  'apy','apy_per_epoch'
 ]);
 const MECH_BOOL_KEYS = envList('MECH_BOOL_KEYS', [
   'reflect','eth_reflect','gamble','swap_enabled','antibot','trading_enabled'
@@ -265,9 +270,9 @@ function normalizeUrl(v, base) {
   if (base) return `${base}${v.replace(/^@/,'')}`;
   return v;
 }
-const isXUrl = u => /https?:\/\/(www\.)?(twitter\.com|x\.com)\//i.test(String(u||''));
-const isTgUrl = u => /https?:\/\/(t\.me|telegram(\.me|\.org))\//i.test(String(u||''));
-const isDcUrl = u => /https?:\/\/(discord\.gg|discord(app)?\.com)\//i.test(String(u||''));
+const isXUrl = u => /https?:\/\/(www\.)?(twitter\.com|x\.com)\//i.test(String(u||'')); // X/Twitter
+const isTgUrl = u => /https?:\/\/(t\.me|telegram(\.me|\.org))\//i.test(String(u||'')); // Telegram
+const isDcUrl = u => /https?:\/\/(discord\.gg|discord(app)?\.com)\//i.test(String(u||'')); // Discord
 
 function classifyUrl(u) {
   const s = String(u || '').trim().toLowerCase();
@@ -440,14 +445,12 @@ async function readSocials(token, txHexInput) {
 }
 
 /* ================= Mechanisms ================= */
-
 /** Per-key denominators; reflect+slices = % (100), APY = bps (10000). */
 const KEY_DENOM = {
   reflect: 100, reflections_percent: 100, reflection_percent: 100, reflection: 100,
   dev_fee: 100, dev_share: 100, developer_fee: 100,
   liquidity_fee: 100, auto_lp: 100, auto_lp_share: 100, lp_share: 100, liquidity_share: 100,
   gamble: 100, gamble_fee: 100, gamble_share: 100, gamble_percent: 100,
-  buy_fee: 100, sell_fee: 100, tax_fee: 100, total_fee: 100,
   burn_buy: 100, burn_sell: 100,
   max_daily_pump: 100,
   apy: 10000, apy_per_epoch: 10000,
@@ -466,7 +469,7 @@ async function readFeeDenominator(token) {
 }
 function guessDenominator(m) {
   const nums = Object.entries(m)
-    .filter(([k,v]) => typeof v === 'string' && /^\d+$/.test(v))
+    .filter(([,v]) => typeof v === 'string' && /^\d+$/.test(v))
     .map(([,v]) => BigInt(v));
   if (nums.some(v => v >= 1000n && v <= 20000n)) return 10000;
   if (nums.some(v => v >= 100n && v <= 1000n))   return 1000;
@@ -512,7 +515,7 @@ async function readMechanisms(token) {
     for (const sig of sigs) { const v = await tryCallBool(token, sig); if (v !== null) { mech[key] = v; break; } }
   }
 
-  // Values (nama getter versi EthOS & variasinya)
+  // Values (typical EthOS getters + variants)
   const uintProbes = [
     ['reflect',         ['reflect() view returns (uint256)','reflection() view returns (uint256)','reflectionPercent() view returns (uint256)','reflectionsPercent() view returns (uint256)','reflectPercent() view returns (uint256)']],
     ['auto_lp_share',   ['autoLPShare() view returns (uint256)','lpShare() view returns (uint256)','autoLiquidityFee() view returns (uint256)','liquidityFee() view returns (uint256)','liquidityShare() view returns (uint256)']],
@@ -524,15 +527,13 @@ async function readMechanisms(token) {
     ['death_time',      ['deathTime() view returns (uint256)','reaperPeriod() view returns (uint256)']],
     ['gamble_period',   ['gamblePeriod() view returns (uint256)','gambleHours() view returns (uint256)']],
     ['apy',             ['apy() view returns (uint256)']],
-    ['apy_per_epoch',   ['apyPerEpoch() view returns (uint256)']],
-    ['max_wallet',      ['maxWallet() view returns (uint256)','maxWalletAmount() view returns (uint256)']],
-    ['max_tx',          ['maxTxAmount() view returns (uint256)','maxTransactionAmount() view returns (uint256)']],
+    ['apy_per_epoch',   ['apyPerEpoch() view returns (uint256)']]
   ];
   for (const [key, sigs] of uintProbes) {
     for (const sig of sigs) { const v = await tryCallUint(token, sig); if (v !== null) { mech[key] = v.toString(); break; } }
   }
 
-  // Tuples populer (beberapa kontrak expose sekaligus)
+  // Common tuples (various codebases)
   Object.assign(mech, await tryCallTuple(token, 'getReflectSplits() view returns (uint256,uint256,uint256)', ['auto_lp_share','gamble','dev_fee']));
   Object.assign(mech, await tryCallTuple(token, 'reflectSplits() view returns (uint256,uint256,uint256)', ['auto_lp_share','gamble','dev_fee']));
   Object.assign(mech, await tryCallTuple(token, 'reflectShares() view returns (uint256,uint256,uint256)', ['auto_lp_share','gamble','dev_fee']));
@@ -559,7 +560,7 @@ async function readMechanisms(token) {
   return mech;
 }
 
-/** Build “Specs Mechanisms” dgn baris Auto LP / ETH Reward / Gamble / Dev Fee. */
+/** Build “Specs Mechanisms” with Auto LP / ETH Reward / Gamble / Dev Fee breakdown. */
 function buildSpecs(mech) {
   if (!mech || !Object.keys(mech).length) return '';
 
@@ -585,7 +586,7 @@ function buildSpecs(mech) {
                       getPctSmart(mech, 'dev_share', 100, defaultDenom) ??
                       getPctSmart(mech, 'developer_fee', 100, defaultDenom);
 
-  // ETH Reward = sisa dari reflect
+  // ETH Reward = remainder of reflect after AutoLP + Gamble + Dev
   let ethRewardSlice = null;
   if (reflectPct != null) {
     const used = (autoLPslice || 0) + (gambleSlice || 0) + (devSlice || 0);
@@ -619,7 +620,7 @@ function buildSpecs(mech) {
   return lines.join('\n');
 }
 
-/* ================= Decoders (tanpa ABI) ================= */
+/* ================= Decoders (no ABI) ================= */
 function decodeTokenCreatedLog(log) {
   try {
     if (!log.topics?.length) return null;
@@ -682,7 +683,7 @@ async function detectNewTokenFromReceipt(receipt) {
     }
   }
 
-  // 3) Dev & LP token amounts (transfer dari factory)
+  // 3) Dev & LP token amounts (transfer from factory)
   let devAmount=0n, lpTokenAmount=0n;
   for (const lg of receipt.logs) {
     if (lg.address.toLowerCase() !== tokenCA.toLowerCase()) continue;
@@ -696,9 +697,10 @@ async function detectNewTokenFromReceipt(receipt) {
     }
   }
 
-  // 4) LP ETH (Mint/Sync atau WETH Deposit→Transfer ke pair)
+  // 4) LP ETH (Mint/Sync or WETH Deposit→Transfer to pair)
   let lpEthWei = 0n;
-  let wethAddr = (WETH_ADDRESS && WETH_ADDRESS.length===42) ? ethers.getAddress(WETH_ADDRESS) : null;
+  let wethAddr = (WETH_ADDRESS && WETH_ADDRESS.length===42) ? ethers.getAddress(WETH_ADDRESS)
+                : (chainIdNum === 1 ? ethers.getAddress('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2') : null); // canonical mainnet WETH
 
   if (pairAddr) {
     for (const lg of receipt.logs) {
@@ -810,11 +812,7 @@ async function resolveFromBlock(fromSpec) {
   const n = Number(fromSpec);
   return Number.isFinite(n) ? n : null;
 }
-
-function socialsLineOrEmpty(s) {
-  const t = socialsLine(s);
-  return t ? t : '';
-}
+const socialsLineOrEmpty = (s) => (socialsLine(s) || '');
 
 async function handleReceipt(receipt) {
   if (iface) { const handled = await handleReceiptWithAbi(receipt); if (handled) return; }
@@ -839,7 +837,7 @@ async function handleReceipt(receipt) {
     ]);
     const socials = socialsRaw ? socialsRaw : {};
 
-    // FDV: (totalSupply * LP_ETH) / LP_TOKENS
+    // FDV (USD only): (totalSupply * LP_ETH) / LP_TOKENS * ETHUSD
     let fdvWei = 0n;
     if (lpTokenAmount>0n && lpEthWei>0n && totalSupply>0n) fdvWei = (totalSupply * lpEthWei) / lpTokenAmount;
     const fdvEthNum = fdvWei>0n ? Number(fmtETH(fdvWei)) : 0;
@@ -869,8 +867,7 @@ async function handleReceipt(receipt) {
       `Dev Hold: <b>${devPct ? devPct.toFixed(2) : '0.00'}%</b>`,
       (lpUsdCombined>0 || lpEthSide>0)
         ? `LP: <b>~$${fmtUSD(lpUsdCombined)} (${fmtEthShort(lpEthSide)} ETH)</b>` : null,
-      (fdvUsd>0) ? `FDV (mcap): <b>~$${fmtUSD(fdvUsd)}</b>`
-                 : (fdvEthNum>0 ? `FDV (mcap): <b>${fdvEthNum.toFixed(12)} ETH</b>` : null)
+      (fdvUsd>0) ? `FDV (mcap): <b>~$${fmtUSD(fdvUsd)}</b>` : null
     ].filter(Boolean).join('\n');
 
     const specs = buildSpecs(mechanisms);
@@ -930,7 +927,7 @@ async function init() {
     }
   });
 
-  console.log('Bot is running. Subscribed to', LAUNCHPAD_ADDRESS);
+  console.log(`Bot is running on chain ${CHAIN_ID}. Subscribed to ${LAUNCHPAD_ADDRESS}`);
   await bot.launch();
 }
 
